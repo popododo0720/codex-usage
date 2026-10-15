@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Read Codex subscription limits without starting a model turn."""
+import argparse
+import datetime as dt
+import json
+import locale
+import math
+import queue
+import subprocess
+import sys
+import threading
+import time
+
+
+class UsageError(Exception):
+    pass
+
+
+def query_limits(timeout):
+    try:
+        proc = subprocess.Popen(
+            ["codex", "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+        )
+    except FileNotFoundError:
+        raise UsageError("Codex CLI not found on PATH.") from None
+    messages = queue.Queue()
+    deadline = time.monotonic() + timeout
+
+    def read_stdout():
+        try:
+            for line in proc.stdout:
+                messages.put(line)
+        finally:
+            messages.put(None)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+
+    def send(message):
+        try:
+            proc.stdin.write(json.dumps(message) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            raise UsageError("Codex app-server closed the connection.") from None
+
+    def response(request_id):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UsageError("Timed out waiting for Codex usage limits.")
+            try:
+                line = messages.get(timeout=remaining)
+            except queue.Empty:
+                raise UsageError("Timed out waiting for Codex usage limits.") from None
+            if line is None:
+                raise UsageError("Codex app-server exited before returning usage limits.")
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                raise UsageError("Codex app-server returned invalid JSON.") from None
+            if not isinstance(message, dict) or message.get("id") != request_id:
+                continue
+            if "error" in message:
+                # Do not echo server errors: they may include sensitive context.
+                raise UsageError(
+                    "Codex rejected the request. Check ChatGPT login with "
+                    "'codex login status'; API-key-only auth cannot provide subscription limits."
+                )
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise UsageError("Codex returned an unexpected response.")
+            return result
+
+    try:
+        send({"id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "codex_usage", "version": "1.0.0"}
+        }})
+        response(1)
+        send({"method": "initialized", "params": {}})
+        send({"id": 2, "method": "account/rateLimits/read"})
+        return response(2)
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        reader.join(timeout=1)
+        proc.stdout.close()
+
+
+def local_reset(timestamp):
+    if timestamp is None:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).astimezone()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def normalize(result):
+    buckets = result.get("rateLimitsByLimitId")
+    if not isinstance(buckets, dict) or not buckets:
+        legacy = result.get("rateLimits")
+        buckets = {legacy.get("limitId") or "codex": legacy} if isinstance(legacy, dict) else {}
+    output = []
+    for key, bucket in buckets.items():
+        if not isinstance(bucket, dict):
+            continue
+        windows = []
+        for name in ("primary", "secondary"):
+            window = bucket.get(name)
+            if not isinstance(window, dict):
+                continue
+            used = window.get("usedPercent")
+            if not isinstance(used, (int, float)) or isinstance(used, bool) or not math.isfinite(used):
+                used = None
+            reset = local_reset(window.get("resetsAt"))
+            windows.append({
+                "window": name,
+                "window_minutes": window.get("windowDurationMins"),
+                "used_percent": used,
+                "remaining_percent": max(0, 100 - used) if used is not None else None,
+                "resets_at": reset.isoformat() if reset else None,
+                "resets_at_local": reset.strftime("%c %Z (%z)") if reset else None,
+            })
+        output.append({"limit_id": bucket.get("limitId") or key,
+                       "name": bucket.get("limitName") or key,
+                       "plan": bucket.get("planType"), "windows": windows})
+    if not any(bucket["windows"] for bucket in output):
+        raise UsageError("No subscription limit windows returned. Check ChatGPT login and plan availability.")
+    return {"checked_at": dt.datetime.now().astimezone().isoformat(), "limits": output}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="Print sanitized JSON for automation")
+    parser.add_argument("--timeout", type=float, default=30, help="Request timeout in seconds (default: 30)")
+    args = parser.parse_args()
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be a positive finite number")
+    try:
+        locale.setlocale(locale.LC_TIME, "")
+    except locale.Error:
+        pass  # Keep the system's default locale when an unavailable locale is configured.
+    try:
+        data = normalize(query_limits(args.timeout))
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        else:
+            for bucket in data["limits"]:
+                print(f"{bucket['name']}" + (f" ({bucket['plan']})" if bucket['plan'] else ""))
+                for window in bucket["windows"]:
+                    minutes = window["window_minutes"]
+                    label = f"{minutes} min" if minutes is not None else window["window"]
+                    left = window["remaining_percent"]
+                    remaining = f"{left:g}% remaining" if left is not None else "remaining unknown"
+                    reset = window["resets_at_local"] or "unknown"
+                    print(f"  {label}: {remaining} | resets {reset}")
+        return 0
+    except (UsageError, OSError) as error:
+        # OS errors are safe to describe by class, without paths or server output.
+        message = str(error) if isinstance(error, UsageError) else "Could not communicate with Codex app-server."
+        if args.json:
+            print(json.dumps({"error": message}), file=sys.stderr)
+        else:
+            print(f"codex-usage: {message}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
